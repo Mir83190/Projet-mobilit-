@@ -1,0 +1,605 @@
+#!/usr/bin/env python3
+"""
+Script final DÉFINITIF pour exporter les horaires Réseau Mistral vers ArcGIS
+Lignes U, 191 et 9 - Export vers couche Amir_horaires_reseaumistral
+CORRECTION: Nom de champ 'horaire_temsp_reel' (avec faute de frappe de la couche)
+"""
+
+import json
+import logging
+import datetime
+import os
+import time
+import requests
+import uuid
+import xml.etree.ElementTree as ET
+import arcgis
+from arcgis.gis import GIS
+from arcgis.features import FeatureLayer
+
+# Initialisation du logging SANS EMOJIS (problème encodage Windows)
+log = logging.getLogger()
+LOG_LEVEL = logging.INFO
+log_file = "mistral_update.log"
+FORMAT = "%(asctime)-15s - %(levelname)s - %(message)s"
+logging.basicConfig(format=FORMAT, level=LOG_LEVEL, datefmt='%Y-%m-%d %H:%M:%S',
+                   handlers=[
+                       logging.FileHandler(log_file, encoding='utf-8'),
+                       logging.StreamHandler()
+                   ])
+
+# Configuration API Mistral
+config = {
+    "url": "https://saes.ratpdev.com/rdtpm",
+    "token": "OPENDATA"
+}
+
+# Constantes
+FEATURE_LAYER_TITLE = "Réseau_mistral_horaires_amir"
+SUIVI_LAYER_TITLE = "amir_suivi_script"
+PROJET_NAME = "Mistral_Horaires"
+
+# Fichier pour stocker la progression
+PROGRESS_FILE = "mistral_progress.json"
+
+# Date actuelle
+NOW = datetime.datetime.now()
+
+# Coordonnées des arrêts
+COORDONNEES_ARRETS = {
+    'TOA57S': {'lat': 43.0869, 'long': 5.9756, 'nom': 'STE MUSSE A57 Sud'},
+    'TOA57N': {'lat': 43.0872, 'long': 5.9758, 'nom': 'STE MUSSE A57 Nord'},
+    'TOHOTE': {'lat': 43.0845, 'long': 5.9821, 'nom': 'HOPITAL STE MUSS Est'},
+    'TOHOME': {'lat': 43.0843, 'long': 5.9818, 'nom': 'HOPITAL STE MUSS Milieu'},
+}
+
+# Configuration des arrêts par ligne
+CONFIGURATION_LIGNES = {
+    'U': [
+        ('TOA57S', 'STE MUSSE A57 (Direction Sud)'),
+        ('TOA57N', 'STE MUSSE A57 (Direction Nord)')
+    ],
+    '191': [
+        ('TOA57S', 'STE MUSSE A57 (Direction Sud)'),
+        ('TOA57N', 'STE MUSSE A57 (Direction Nord)')
+    ],
+    '9': [
+        ('TOHOTE', 'HOPITAL STE MUSS Est'),
+        ('TOHOME', 'HOPITAL STE MUSS Milieu')
+    ]
+}
+
+def save_progress(status="OK", message=None, count=0):
+    """Sauve la progression"""
+    data = {
+        "last_execution": NOW.isoformat(),
+        "status": status,
+        "message": message,
+        "count": count,
+        "timestamp": datetime.datetime.now().isoformat()
+    }
+    
+    with open(PROGRESS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    
+    log.info(f"Progression sauvegardée: {status} - {count} horaires traités")
+
+def generate_message_id():
+    return f"Mistral:Message::{uuid.uuid4()}:LOC"
+
+def get_current_timestamp():
+    return datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+def get_horaires_ligne(stop_ref, stop_name, ligne):
+    """Récupère les horaires pour une ligne donnée à un arrêt"""
+    url = config["url"]
+    token = config["token"]
+    timestamp = get_current_timestamp()
+    message_id = generate_message_id()
+    
+    xml_request = f"""<?xml version="1.0" encoding="UTF-8"?>
+<S:Envelope xmlns:S="http://schemas.xmlsoap.org/soap/envelope/">
+    <S:Body>
+        <sw:GetStopMonitoring xmlns:sw="http://wsdl.siri.org.uk" xmlns:siri="http://www.siri.org.uk/siri">
+            <ServiceRequestInfo>
+                <siri:RequestTimestamp>{timestamp}</siri:RequestTimestamp>
+                <siri:RequestorRef>{token}</siri:RequestorRef>
+                <siri:MessageIdentifier>{message_id}</siri:MessageIdentifier>
+            </ServiceRequestInfo>
+            <Request version="2.0:FR-IDF-2.4">
+                <siri:RequestTimestamp>{timestamp}</siri:RequestTimestamp>
+                <siri:MessageIdentifier>{message_id}-2</siri:MessageIdentifier>
+                <siri:MonitoringRef>{stop_ref}</siri:MonitoringRef>
+                <siri:LineRef>{ligne}</siri:LineRef>
+                <siri:MaximumStopVisits>50</siri:MaximumStopVisits>
+                <siri:MinimumStopVisitsPerLine>20</siri:MinimumStopVisitsPerLine>
+                <siri:StopVisitTypes>all</siri:StopVisitTypes>
+                <siri:PreviewInterval>PT6H</siri:PreviewInterval>
+            </Request>
+            <RequestExtension />
+        </sw:GetStopMonitoring>
+    </S:Body>
+</S:Envelope>"""
+    
+    headers = {
+        'Content-Type': 'application/xml',
+        'SOAPAction': '""'
+    }
+    
+    try:
+        response = requests.post(url, data=xml_request, headers=headers, timeout=30)
+        
+        if response.status_code == 200:
+            return response.text
+        else:
+            log.warning(f"Erreur {response.status_code} pour {stop_ref} ligne {ligne}")
+            return None
+            
+    except Exception as e:
+        log.warning(f"Erreur requête {stop_ref} ligne {ligne}: {e}")
+        return None
+
+def parse_horaires_ligne(xml_response, stop_ref, stop_name, ligne):
+    """Parse les horaires - VERSION SIMPLIFIÉE AVEC DEBUG"""
+    if not xml_response:
+        return []
+    
+    try:
+        root = ET.fromstring(xml_response)
+        
+        namespaces = {
+            'siri': 'http://www.siri.org.uk/siri'
+        }
+        
+        visit_elements = root.findall('.//siri:MonitoredStopVisit', namespaces)
+        horaires = []
+        
+        log.info(f"LIGNE {ligne} sur {stop_ref}: {len(visit_elements)} passage(s) trouvé(s)")
+        
+        for i, visit in enumerate(visit_elements, 1):
+            horaire_info = {'ligne': ligne, 'arret': stop_ref, 'arret_nom': stop_name}
+            
+            # Direction et destination
+            direction = visit.find('.//siri:DirectionName', namespaces)
+            destination = visit.find('.//siri:DestinationName', namespaces)
+            
+            # Horaires - ÉLÉMENTS CLÉS
+            horaire_theorique = visit.find('.//siri:AimedArrivalTime', namespaces)
+            horaire_temps_reel = visit.find('.//siri:ExpectedArrivalTime', namespaces)
+            
+            # Véhicule et statut - ÉLÉMENTS CLÉS POUR TEMPS RÉEL
+            vehicule = visit.find('.//siri:VehicleRef', namespaces)
+            statut = visit.find('.//siri:DepartureStatus', namespaces)
+            
+            # LOGIQUE SIMPLIFIÉE POUR DÉTECTION TEMPS RÉEL
+            has_vehicle = vehicule is not None and vehicule.text is not None
+            has_realtime_schedule = horaire_temps_reel is not None and horaire_temps_reel.text is not None
+            
+            is_realtime = has_vehicle and has_realtime_schedule
+            
+            # Stockage des informations de base
+            horaire_info['destination'] = destination.text if destination is not None else 'N/A'
+            horaire_info['direction'] = direction.text if direction is not None else 'N/A'
+            
+            # TRAITEMENT HORAIRES
+            # 1. Horaire théorique (TOUJOURS présent)
+            if horaire_theorique is not None:
+                try:
+                    dt = datetime.datetime.fromisoformat(horaire_theorique.text.replace('Z', '+00:00'))
+                    horaire_info['horaire_theorique'] = dt
+                    horaire_info['horaire_theorique_str'] = dt.strftime('%H:%M:%S')
+                except Exception as e:
+                    log.error(f"Erreur conversion horaire théorique: {e}")
+                    horaire_info['horaire_theorique'] = None
+                    horaire_info['horaire_theorique_str'] = horaire_theorique.text
+            else:
+                horaire_info['horaire_theorique'] = None
+                horaire_info['horaire_theorique_str'] = None
+            
+            # 2. Horaire temps réel (SEULEMENT si is_realtime)
+            if is_realtime and horaire_temps_reel is not None:
+                try:
+                    dt = datetime.datetime.fromisoformat(horaire_temps_reel.text.replace('Z', '+00:00'))
+                    horaire_info['horaire_temps_reel'] = dt
+                    horaire_info['horaire_temps_reel_str'] = dt.strftime('%H:%M:%S')
+                    log.info(f"  TEMPS REEL DETECTE: Bus {vehicule.text} à {horaire_info['horaire_temps_reel_str']}")
+                except Exception as e:
+                    log.error(f"Erreur conversion horaire temps réel: {e}")
+                    horaire_info['horaire_temps_reel'] = None
+                    horaire_info['horaire_temps_reel_str'] = None
+                    is_realtime = False
+            else:
+                horaire_info['horaire_temps_reel'] = None
+                horaire_info['horaire_temps_reel_str'] = None
+            
+            # Stockage du flag
+            horaire_info['is_realtime'] = is_realtime
+            
+            # Bus number
+            if vehicule is not None and vehicule.text:
+                horaire_info['bus_num'] = vehicule.text
+            else:
+                horaire_info['bus_num'] = f"TH_{ligne}_{i}_{stop_ref}"
+            
+            # Statut
+            if statut is not None:
+                statut_fr = {
+                    'delayed': 'En retard',
+                    'onTime': 'À l\'heure', 
+                    'early': 'En avance',
+                    'noReport': 'Pas d\'info'
+                }.get(statut.text, statut.text)
+                horaire_info['statut'] = statut_fr
+            elif is_realtime:
+                horaire_info['statut'] = 'Temps réel'
+            else:
+                horaire_info['statut'] = 'Théorique'
+            
+            # Retard
+            retard = visit.find('.//siri:Delay', namespaces)
+            if retard is not None:
+                retard_text = retard.text
+                if 'PT' in retard_text:
+                    horaire_info['retard'] = retard_text.replace('PT', '').replace('.000S', 'S')
+                else:
+                    horaire_info['retard'] = retard_text
+            else:
+                horaire_info['retard'] = '0S'
+            
+            # Autres infos
+            horaire_info['passage'] = i
+            
+            # Coordonnées
+            if stop_ref in COORDONNEES_ARRETS:
+                coords = COORDONNEES_ARRETS[stop_ref]
+                horaire_info['lat'] = coords['lat']
+                horaire_info['long'] = coords['long']
+            else:
+                horaire_info['lat'] = 43.1242
+                horaire_info['long'] = 5.9306
+            
+            horaires.append(horaire_info)
+        
+        return horaires
+        
+    except Exception as e:
+        log.error(f"Erreur parsing {stop_ref} ligne {ligne}: {e}")
+        return []
+
+def get_mistral_data_from_api():
+    """Récupère toutes les données horaires depuis l'API Mistral"""
+    log.info("=== RÉCUPÉRATION DONNÉES API MISTRAL ===")
+    
+    all_horaires = []
+    total_passages = 0
+    total_realtime = 0
+    total_theorique = 0
+    
+    # Parcourir chaque ligne et ses arrêts
+    for ligne, arrets in CONFIGURATION_LIGNES.items():
+        log.info(f"=== CONSULTATION LIGNE {ligne} ===")
+        
+        for stop_ref, stop_name in arrets:
+            log.info(f"\nConsultation arrêt {stop_ref} - Ligne {ligne}...")
+            
+            xml_response = get_horaires_ligne(stop_ref, stop_name, ligne)
+            horaires = parse_horaires_ligne(xml_response, stop_ref, stop_name, ligne)
+            
+            all_horaires.extend(horaires)
+            total_passages += len(horaires)
+    
+    # Statistiques finales
+    for h in all_horaires:
+        if h.get('is_realtime'):
+            total_realtime += 1
+        else:
+            total_theorique += 1
+    
+    log.info(f"\n=== STATISTIQUES FINALES ===")
+    log.info(f"Total horaires: {total_passages}")
+    log.info(f"Temps réel: {total_realtime}")
+    log.info(f"Théoriques: {total_theorique}")
+    
+    # Exemples pour vérification
+    log.info(f"\n=== EXEMPLES POUR VÉRIFICATION ===")
+    for i, h in enumerate(all_horaires[:10]):  # 10 premiers
+        temps_reel_str = h.get('horaire_temps_reel_str', 'None')
+        theorique_str = h.get('horaire_theorique_str', 'None')
+        log.info(f"Ex {i+1}: Bus {h['bus_num']} | realtime={h.get('is_realtime')} | TR:{temps_reel_str} | TH:{theorique_str}")
+    
+    return all_horaires
+
+
+
+def convert_to_arcgis_features(horaires_data):
+    """Version TEST avec les 2 formats DateTime"""
+    log.info(f"=== CONVERSION TEST - 2 FORMATS DATETIME ===")
+    
+    features = []
+    
+    for horaire in horaires_data:
+        try:
+            # ========== TEST 1: FORMAT SNCF (Objets DateTime) ==========
+            horaire_temps_reel_datetime = None
+            horaire_theorique_datetime = None
+            
+            if horaire.get('is_realtime') and horaire.get('horaire_temps_reel'):
+                horaire_temps_reel_datetime = horaire['horaire_temps_reel']  # ← OBJET DateTime direct
+            
+            if horaire.get('horaire_theorique'):
+                horaire_theorique_datetime = horaire['horaire_theorique']    # ← OBJET DateTime direct
+            
+            # ========== ATTRIBUTS AVEC FORMAT SNCF ==========
+            feature_attrs = {
+                "bus_num": horaire.get('bus_num', 'N/A'),
+                "bus": horaire.get('ligne', 'N/A'),
+                "Passage": horaire.get('passage', 1),
+                "Destination": horaire.get('destination', 'N/A'),
+                "Direction": horaire.get('direction', 'N/A'),
+                
+                # FORMAT SNCF: Objets DateTime directs (comme le script qui marche)
+                "horaire_temsp_reel": horaire_temps_reel_datetime,     # ← OBJET DateTime
+                "horaire_theorique": horaire_theorique_datetime,       # ← OBJET DateTime
+                
+                "statut": horaire.get('statut', 'N/A'),
+                "retard": horaire.get('retard', '0S'),
+                "lat": horaire.get('lat', 43.1242),
+                "long": horaire.get('long', 5.9306),
+                "date_import": datetime.datetime.now()  # ← OBJET DateTime aussi
+            }
+            
+            # Créer la géométrie
+            geometry = arcgis.geometry.Point({
+                "x": horaire.get('long', 5.9306),
+                "y": horaire.get('lat', 43.1242),
+                "spatialReference": {"wkid": 4326}
+            })
+            
+            # Créer la feature
+            feature = arcgis.features.Feature.from_dict({
+                "attributes": feature_attrs,
+                "geometry": geometry
+            })
+            
+            features.append(feature)
+            
+            # Log pour debug
+            if horaire_temps_reel_datetime:
+                log.info(f"TEST DateTime: Bus {horaire.get('bus_num')} - TR: {horaire_temps_reel_datetime}")
+            
+        except Exception as e:
+            log.warning(f"Erreur création feature: {e}")
+            continue
+    
+    log.info(f"TEST TERMINÉ: {len(features)} features avec FORMAT SNCF (DateTime objects)")
+    return features
+
+# ========== ALTERNATIVE: Si le format DateTime ne marche pas ==========
+
+def convert_to_arcgis_features_ALTERNATIVE(horaires_data):
+    """Version ALTERNATIVE avec timestamps mais diagnostic renforcé"""
+    
+    features = []
+    
+    for horaire in horaires_data:
+        try:
+            # Diagnostique AVANT conversion
+            log.info(f"DEBUG: Bus {horaire.get('bus_num')}")
+            log.info(f"  is_realtime: {horaire.get('is_realtime')}")
+            log.info(f"  horaire_temps_reel: {horaire.get('horaire_temps_reel')}")
+            log.info(f"  horaire_theorique: {horaire.get('horaire_theorique')}")
+            
+            # Conversion avec validation
+            horaire_temps_reel_timestamp = None
+            if horaire.get('is_realtime') and horaire.get('horaire_temps_reel'):
+                ts = int(horaire['horaire_temps_reel'].timestamp() * 1000)
+                horaire_temps_reel_timestamp = ts
+                log.info(f"  → timestamp TR: {ts}")
+            
+            horaire_theorique_timestamp = None
+            if horaire.get('horaire_theorique'):
+                ts = int(horaire['horaire_theorique'].timestamp() * 1000)
+                horaire_theorique_timestamp = ts
+                log.info(f"  → timestamp TH: {ts}")
+            
+            # Vérification EXACTE des noms de champs
+            feature_attrs = {
+                "bus_num": horaire.get('bus_num', 'N/A'),
+                "bus": horaire.get('ligne', 'N/A'),
+                "Passage": horaire.get('passage', 1),
+                "Destination": horaire.get('destination', 'N/A'),
+                "Direction": horaire.get('direction', 'N/A'),
+                "horaire_temsp_reel": horaire_temps_reel_timestamp,  # VÉRIFIER LE NOM !
+                "horaire_theorique": horaire_theorique_timestamp,
+                "statut": horaire.get('statut', 'N/A'),
+                "retard": horaire.get('retard', '0S'),
+                "lat": horaire.get('lat', 43.1242),
+                "long": horaire.get('long', 5.9306),
+                "date_import": int(time.time() * 1000)
+            }
+            
+            # Log des attributs AVANT envoi
+            log.info(f"  ATTRIBUTS: {feature_attrs}")
+            
+            geometry = arcgis.geometry.Point({
+                "x": horaire.get('long', 5.9306),
+                "y": horaire.get('lat', 43.1242),
+                "spatialReference": {"wkid": 4326}
+            })
+            
+            feature = arcgis.features.Feature.from_dict({
+                "attributes": feature_attrs,
+                "geometry": geometry
+            })
+            
+            features.append(feature)
+            
+        except Exception as e:
+            log.error(f"Erreur création feature: {e}")
+            continue
+    
+    return features
+
+class ArcgisHelper:
+    """Classe pour interagir avec ArcGIS"""
+    def __init__(self):
+        self.gis = GIS("home")
+    
+    def findFeatureLayerByTitle(self, title):
+        """Trouve une couche par son titre"""
+        items = self.gis.content.search(title, item_type="Feature Layer")
+        if items:
+            return items[0].layers[0]
+        return None
+    
+    def log_execution(self, statut, nb_enregistrements, message=None):
+        """Enregistre l'exécution dans la couche de suivi"""
+        try:
+            suivi_layer = self.findFeatureLayerByTitle(SUIVI_LAYER_TITLE)
+            if not suivi_layer:
+                log.error(f"Couche de suivi {SUIVI_LAYER_TITLE} non trouvée")
+                return False
+            
+            suivi_record = {
+                "attributes": {
+                    "projet": PROJET_NAME,
+                    "statut": statut,
+                    "date_debut": int(time.time() * 1000),
+                    "date_fin": int(time.time() * 1000),
+                    "nb_enregistrements": nb_enregistrements,
+                    "message": message or "",
+                    "alerte_envoyee": 0
+                }
+            }
+            
+            result = suivi_layer.edit_features(adds=[suivi_record])
+            
+            if 'addResults' in result and result['addResults'][0]['success']:
+                log.info(f"Exécution enregistrée dans la couche de suivi: {statut}")
+                return True
+            else:
+                log.error(f"Erreur lors de l'enregistrement: {result}")
+                return False
+                
+        except Exception as e:
+            log.error(f"Erreur couche de suivi: {str(e)}")
+            return False
+    
+    def update_horaires_data(self, horaires_layer, new_features):
+        """Met à jour les données horaires avec vidage complet (1=1)"""
+        log.info("=== MISE À JOUR COUCHE ARCGIS ===")
+        
+        try:
+            # 1. Supprimer tous les enregistrements existants
+            log.info("Suppression de tous les enregistrements existants...")
+            delete_result = horaires_layer.delete_features(where="1=1")
+            
+            if 'deleteResults' in delete_result:
+                deleted_count = len([r for r in delete_result['deleteResults'] if r.get('success', False)])
+                log.info(f"Enregistrements supprimés: {deleted_count}")
+            else:
+                log.info("Suppression effectuée")
+            
+            # 2. Ajouter tous les nouveaux horaires
+            if new_features:
+                log.info(f"Ajout de {len(new_features)} nouveaux horaires...")
+                add_result = horaires_layer.edit_features(adds=new_features)
+                
+                if 'addResults' in add_result:
+                    added_count = len([r for r in add_result['addResults'] if r.get('success', False)])
+                    failed_count = len([r for r in add_result['addResults'] if not r.get('success', False)])
+                    
+                    log.info(f"Horaires ajoutés avec succès: {added_count}")
+                    if failed_count > 0:
+                        log.warning(f"Horaires échoués: {failed_count}")
+                        # Afficher quelques erreurs
+                        for i, result in enumerate(add_result['addResults'][:5]):
+                            if not result.get('success', False):
+                                error_msg = result.get('error', {}).get('description', 'Erreur inconnue')
+                                log.error(f"Erreur horaire {i}: {error_msg}")
+                    
+                    return added_count
+                else:
+                    log.error(f"Format de réponse inattendu: {add_result}")
+                    return 0
+            else:
+                log.info("Aucun nouvel horaire à ajouter")
+                return 0
+                
+        except Exception as e:
+            log.error(f"Erreur lors de la mise à jour: {str(e)}")
+            return 0
+
+def main():
+    """Fonction principale"""
+    start_time = time.time()
+    log.info("====== DÉMARRAGE MISE À JOUR MISTRAL - VERSION DÉFINITIVE ======")
+    log.info("====== HORAIRES LIGNES U, 191 & 9 - TEMPS RÉEL + THÉORIQUES ======")
+    log.info("====== CORRECTION: Nom de champ 'horaire_temsp_reel' ======")
+    
+    arcgis_helper = ArcgisHelper()
+    statut = "OK"
+    message = ""
+    nb_operations = 0
+    
+    try:
+        # Connexion à la couche Mistral
+        horaires_layer = arcgis_helper.findFeatureLayerByTitle(FEATURE_LAYER_TITLE)
+        if not horaires_layer:
+            raise Exception(f"Couche {FEATURE_LAYER_TITLE} introuvable")
+        
+        log.info(f"Couche trouvée: {horaires_layer.properties['name']}")
+        
+        # Récupérer les données depuis l'API Mistral
+        horaires_data = get_mistral_data_from_api()
+        
+        if horaires_data:
+            # Convertir en features ArcGIS avec correction nom de champ
+            new_features = convert_to_arcgis_features(horaires_data)
+            
+            if new_features:
+                # Mettre à jour la couche
+                nb_operations = arcgis_helper.update_horaires_data(horaires_layer, new_features)
+                
+                # Compter les temps réels
+                realtime_count = sum(1 for h in horaires_data if h.get('is_realtime'))
+                
+                message = f"Mise à jour réussie. {nb_operations} horaires traités (dont {realtime_count} temps réel) - Lignes U, 191, 9."
+                save_progress("OK", message, nb_operations)
+                
+                log.info(f"=== RÉSULTAT FINAL ===")
+                log.info(f"Horaires traités: {nb_operations}")
+                log.info(f"Temps réel détectés: {realtime_count}")
+                log.info(f"Théoriques: {nb_operations - realtime_count}")
+                
+            else:
+                message = "Erreur conversion en features ArcGIS"
+                log.error(message)
+                save_progress("ERROR", message, 0)
+                statut = "ERROR"
+        else:
+            message = "Aucune donnée disponible depuis l'API Mistral"
+            log.warning(message)
+            save_progress("WARNING", message, 0)
+            statut = "WARNING"
+        
+        # Temps d'exécution
+        elapsed_time = time.time() - start_time
+        log.info(f"====== FIN MISE À JOUR - Durée: {elapsed_time:.1f}s ======")
+        
+    except Exception as e:
+        statut = "ERREUR"
+        message = f"Erreur: {str(e)}"
+        log.exception(f"Erreur lors de la mise à jour: {str(e)}")
+        save_progress("ERROR", message, 0)
+    
+    finally:
+        # Enregistrer dans la couche de suivi
+        arcgis_helper.log_execution(statut, nb_operations, message)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        log.critical(f"Erreur critique: {str(e)}")
+        exit(1)
