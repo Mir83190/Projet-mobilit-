@@ -2,7 +2,7 @@
 """
 Script final DÉFINITIF pour exporter les horaires Réseau Mistral vers ArcGIS
 Lignes U, 191 et 9 - Export vers couche Amir_horaires_reseaumistral
-CORRECTION: Nom de champ 'horaire_temsp_reel' (avec faute de frappe de la couche)
+CORRECTION FINALE: Logique départ/arrivée + priorité temps réel/théorique
 """
 
 import json
@@ -64,6 +64,10 @@ CONFIGURATION_LIGNES = {
         ('TOA57N', 'STE MUSSE A57 (Direction Nord)')
     ],
     '9': [
+        ('TOHOTE', 'HOPITAL STE MUSS Est'),
+        ('TOHOME', 'HOPITAL STE MUSS Milieu')
+    ],
+    '1': [
         ('TOHOTE', 'HOPITAL STE MUSS Est'),
         ('TOHOME', 'HOPITAL STE MUSS Milieu')
     ]
@@ -140,7 +144,7 @@ def get_horaires_ligne(stop_ref, stop_name, ligne):
         return None
 
 def parse_horaires_ligne(xml_response, stop_ref, stop_name, ligne):
-    """Parse les horaires - VERSION SIMPLIFIÉE AVEC DEBUG"""
+    """Parse les horaires - VERSION FINALE CORRIGÉE avec logique départ/arrivée"""
     if not xml_response:
         return []
     
@@ -154,7 +158,7 @@ def parse_horaires_ligne(xml_response, stop_ref, stop_name, ligne):
         visit_elements = root.findall('.//siri:MonitoredStopVisit', namespaces)
         horaires = []
         
-        log.info(f"LIGNE {ligne} sur {stop_ref}: {len(visit_elements)} passage(s) trouvé(s)")
+        log.info(f"LIGNE {ligne} sur {stop_ref}: {len(visit_elements)} passage(s)")
         
         for i, visit in enumerate(visit_elements, 1):
             horaire_info = {'ligne': ligne, 'arret': stop_ref, 'arret_nom': stop_name}
@@ -163,46 +167,68 @@ def parse_horaires_ligne(xml_response, stop_ref, stop_name, ligne):
             direction = visit.find('.//siri:DirectionName', namespaces)
             destination = visit.find('.//siri:DestinationName', namespaces)
             
-            # Horaires - ÉLÉMENTS CLÉS
-            horaire_theorique = visit.find('.//siri:AimedArrivalTime', namespaces)
-            horaire_temps_reel = visit.find('.//siri:ExpectedArrivalTime', namespaces)
+            # LOGIQUE CORRIGÉE - DIFFÉRENCIER DÉPART/ARRIVÉE
+            # Horaires DÉPARTS (pour les arrêts de départ comme TOHOME)
+            horaire_theorique_depart = visit.find('.//siri:AimedDepartureTime', namespaces)
+            horaire_temps_reel_depart = visit.find('.//siri:ExpectedDepartureTime', namespaces)
             
-            # Véhicule et statut - ÉLÉMENTS CLÉS POUR TEMPS RÉEL
+            # Horaires ARRIVÉES (pour les arrêts d'arrivée comme TOHOTE)  
+            horaire_theorique_arrivee = visit.find('.//siri:AimedArrivalTime', namespaces)
+            horaire_temps_reel_arrivee = visit.find('.//siri:ExpectedArrivalTime', namespaces)
+            
+            # Déterminer quel type d'horaire utiliser selon l'arrêt
+            if stop_ref == "TOHOME":
+                # Arrêt de départ → utiliser DepartureTime
+                horaire_theorique = horaire_theorique_depart
+                horaire_temps_reel = horaire_temps_reel_depart
+                type_horaire = "Départ"
+                log.info(f"TOHOME: DepartureTime bus {i}")
+            else:
+                # Arrêt d'arrivée → utiliser ArrivalTime  
+                horaire_theorique = horaire_theorique_arrivee
+                horaire_temps_reel = horaire_temps_reel_arrivee
+                type_horaire = "Arrivée"
+                log.info(f"{stop_ref}: ArrivalTime bus {i}")
+            
+            # Véhicule et statut
             vehicule = visit.find('.//siri:VehicleRef', namespaces)
             statut = visit.find('.//siri:DepartureStatus', namespaces)
             
-            # LOGIQUE SIMPLIFIÉE POUR DÉTECTION TEMPS RÉEL
+            # LOGIQUE SIMPLIFIÉE POUR DÉTECTION TEMPS RÉEL - VERSION CORRIGÉE
             has_vehicle = vehicule is not None and vehicule.text is not None
-            has_realtime_schedule = horaire_temps_reel is not None and horaire_temps_reel.text is not None
+            has_expected_time = horaire_temps_reel is not None and horaire_temps_reel.text is not None
             
-            is_realtime = has_vehicle and has_realtime_schedule
+            # Considérer comme temps réel si on a ExpectedTime, même sans véhicule
+            is_realtime = has_vehicle or has_expected_time
             
             # Stockage des informations de base
             horaire_info['destination'] = destination.text if destination is not None else 'N/A'
             horaire_info['direction'] = direction.text if direction is not None else 'N/A'
             
-            # TRAITEMENT HORAIRES
-            # 1. Horaire théorique (TOUJOURS présent)
-            if horaire_theorique is not None:
+            # TRAITEMENT HORAIRES - PRIORITÉ TEMPS RÉEL puis THÉORIQUE
+            # 1. Horaire théorique (base de référence)
+            if horaire_theorique is not None and horaire_theorique.text:
                 try:
                     dt = datetime.datetime.fromisoformat(horaire_theorique.text.replace('Z', '+00:00'))
                     horaire_info['horaire_theorique'] = dt
                     horaire_info['horaire_theorique_str'] = dt.strftime('%H:%M:%S')
+                    log.info(f"  TH: {horaire_info['horaire_theorique_str']}")
                 except Exception as e:
                     log.error(f"Erreur conversion horaire théorique: {e}")
                     horaire_info['horaire_theorique'] = None
-                    horaire_info['horaire_theorique_str'] = horaire_theorique.text
+                    horaire_info['horaire_theorique_str'] = None
             else:
+                log.warning(f"  AUCUN horaire théorique bus {i}")
                 horaire_info['horaire_theorique'] = None
                 horaire_info['horaire_theorique_str'] = None
             
-            # 2. Horaire temps réel (SEULEMENT si is_realtime)
-            if is_realtime and horaire_temps_reel is not None:
+            # 2. Horaire temps réel (prioritaire s'il existe)
+            if has_expected_time:
                 try:
                     dt = datetime.datetime.fromisoformat(horaire_temps_reel.text.replace('Z', '+00:00'))
                     horaire_info['horaire_temps_reel'] = dt
                     horaire_info['horaire_temps_reel_str'] = dt.strftime('%H:%M:%S')
-                    log.info(f"  TEMPS REEL DETECTE: Bus {vehicule.text} à {horaire_info['horaire_temps_reel_str']}")
+                    log.info(f"  TR: {horaire_info['horaire_temps_reel_str']}")
                 except Exception as e:
                     log.error(f"Erreur conversion horaire temps réel: {e}")
                     horaire_info['horaire_temps_reel'] = None
@@ -230,8 +256,8 @@ def parse_horaires_ligne(xml_response, stop_ref, stop_name, ligne):
                     'noReport': 'Pas d\'info'
                 }.get(statut.text, statut.text)
                 horaire_info['statut'] = statut_fr
-            elif is_realtime:
-                horaire_info['statut'] = 'Temps réel'
+            elif has_expected_time:
+                horaire_info['statut'] = 'Temps réel' if has_vehicle else 'Temps réel estimé'
             else:
                 horaire_info['statut'] = 'Théorique'
             
@@ -295,57 +321,76 @@ def get_mistral_data_from_api():
         else:
             total_theorique += 1
     
-    log.info(f"\n=== STATISTIQUES FINALES ===")
-    log.info(f"Total horaires: {total_passages}")
-    log.info(f"Temps réel: {total_realtime}")
-    log.info(f"Théoriques: {total_theorique}")
-    
-    # Exemples pour vérification
-    log.info(f"\n=== EXEMPLES POUR VÉRIFICATION ===")
-    for i, h in enumerate(all_horaires[:10]):  # 10 premiers
-        temps_reel_str = h.get('horaire_temps_reel_str', 'None')
-        theorique_str = h.get('horaire_theorique_str', 'None')
-        log.info(f"Ex {i+1}: Bus {h['bus_num']} | realtime={h.get('is_realtime')} | TR:{temps_reel_str} | TH:{theorique_str}")
+    log.info(f"=== STATS FINALES ===")
+    log.info(f"Total: {total_passages} | TR: {total_realtime} | TH: {total_theorique}")
     
     return all_horaires
 
-
-
 def convert_to_arcgis_features(horaires_data):
-    """Version TEST avec les 2 formats DateTime"""
-    log.info(f"=== CONVERSION TEST - 2 FORMATS DATETIME ===")
+    """Version FINALE - Priorité temps réel puis théorique, garantit toujours un horaire"""
+    log.info(f"=== CONVERSION FINALE - PRIORITÉ TEMPS RÉEL + FALLBACK THÉORIQUE ===")
     
     features = []
     
     for horaire in horaires_data:
         try:
-            # ========== TEST 1: FORMAT SNCF (Objets DateTime) ==========
+            # LOGIQUE FINALE : Temps réel en priorité, théorique en fallback
             horaire_temps_reel_datetime = None
             horaire_theorique_datetime = None
             
-            if horaire.get('is_realtime') and horaire.get('horaire_temps_reel'):
-                horaire_temps_reel_datetime = horaire['horaire_temps_reel']  # ← OBJET DateTime direct
+            # 1. Récupérer horaire temps réel s'il existe
+            if horaire.get('horaire_temps_reel'):
+                horaire_temps_reel_datetime = horaire['horaire_temps_reel']
             
+            # 2. Récupérer horaire théorique s'il existe
             if horaire.get('horaire_theorique'):
-                horaire_theorique_datetime = horaire['horaire_theorique']    # ← OBJET DateTime direct
+                horaire_theorique_datetime = horaire['horaire_theorique']
             
-            # ========== ATTRIBUTS AVEC FORMAT SNCF ==========
+            # 3. GARANTIR qu'on a toujours un horaire dans horaire_temsp_reel
+            # Priorité : temps réel > théorique
+            horaire_principal = horaire_temps_reel_datetime or horaire_theorique_datetime
+            
+            if horaire_principal is None:
+                log.warning(f"AUCUN horaire pour bus {horaire.get('bus_num')} - IGNORÉ")
+                continue
+            
+            # TRADUCTION DESTINATIONS pour lisibilité
+            destination_traduite = {
+                'HOPITAL STE MUSS': 'Hôpital Sainte-Musse',
+                'GARE (TOULON)': 'Gare de Toulon', 
+                'CTR CIAL OLL TER': 'CC Ollioules',
+                'POLE D\'ACTIVITE': 'Pôle d\'Activité',
+                'TECHNOPOLE DE LA': 'Technopôle',
+                'OBSERVATOIRE': 'Observatoire',
+                'TOURRACHE': 'Tourrache',
+                'CAT VERT': 'Cat Vert'
+            }.get(horaire.get('destination', 'N/A'), horaire.get('destination', 'N/A'))
+            
+            # DIRECTION CLAIRE
+            direction_traduite = {
+                'R': 'Retour',
+                'A': 'Aller'
+            }.get(horaire.get('direction', 'N/A'), horaire.get('direction', 'N/A'))
+            
             feature_attrs = {
                 "bus_num": horaire.get('bus_num', 'N/A'),
                 "bus": horaire.get('ligne', 'N/A'),
                 "Passage": horaire.get('passage', 1),
-                "Destination": horaire.get('destination', 'N/A'),
-                "Direction": horaire.get('direction', 'N/A'),
+                "Destination": destination_traduite,
+                "Direction": direction_traduite,
                 
-                # FORMAT SNCF: Objets DateTime directs (comme le script qui marche)
-                "horaire_temsp_reel": horaire_temps_reel_datetime,     # ← OBJET DateTime
-                "horaire_theorique": horaire_theorique_datetime,       # ← OBJET DateTime
+                # CHAMP PRINCIPAL : horaire_temsp_reel (avec faute de frappe de la couche)
+                # Contient le temps réel si disponible, sinon le théorique
+                "horaire_temsp_reel": horaire_principal,
+                
+                # CHAMP THÉORIQUE : pour référence
+                "horaire_theorique": horaire_theorique_datetime,
                 
                 "statut": horaire.get('statut', 'N/A'),
                 "retard": horaire.get('retard', '0S'),
                 "lat": horaire.get('lat', 43.1242),
                 "long": horaire.get('long', 5.9306),
-                "date_import": datetime.datetime.now()  # ← OBJET DateTime aussi
+                "date_import": datetime.datetime.now()
             }
             
             # Créer la géométrie
@@ -363,81 +408,11 @@ def convert_to_arcgis_features(horaires_data):
             
             features.append(feature)
             
-            # Log pour debug
-            if horaire_temps_reel_datetime:
-                log.info(f"TEST DateTime: Bus {horaire.get('bus_num')} - TR: {horaire_temps_reel_datetime}")
-            
         except Exception as e:
-            log.warning(f"Erreur création feature: {e}")
+            log.warning(f"Erreur création feature pour bus {horaire.get('bus_num', 'N/A')}: {e}")
             continue
     
-    log.info(f"TEST TERMINÉ: {len(features)} features avec FORMAT SNCF (DateTime objects)")
-    return features
-
-# ========== ALTERNATIVE: Si le format DateTime ne marche pas ==========
-
-def convert_to_arcgis_features_ALTERNATIVE(horaires_data):
-    """Version ALTERNATIVE avec timestamps mais diagnostic renforcé"""
-    
-    features = []
-    
-    for horaire in horaires_data:
-        try:
-            # Diagnostique AVANT conversion
-            log.info(f"DEBUG: Bus {horaire.get('bus_num')}")
-            log.info(f"  is_realtime: {horaire.get('is_realtime')}")
-            log.info(f"  horaire_temps_reel: {horaire.get('horaire_temps_reel')}")
-            log.info(f"  horaire_theorique: {horaire.get('horaire_theorique')}")
-            
-            # Conversion avec validation
-            horaire_temps_reel_timestamp = None
-            if horaire.get('is_realtime') and horaire.get('horaire_temps_reel'):
-                ts = int(horaire['horaire_temps_reel'].timestamp() * 1000)
-                horaire_temps_reel_timestamp = ts
-                log.info(f"  → timestamp TR: {ts}")
-            
-            horaire_theorique_timestamp = None
-            if horaire.get('horaire_theorique'):
-                ts = int(horaire['horaire_theorique'].timestamp() * 1000)
-                horaire_theorique_timestamp = ts
-                log.info(f"  → timestamp TH: {ts}")
-            
-            # Vérification EXACTE des noms de champs
-            feature_attrs = {
-                "bus_num": horaire.get('bus_num', 'N/A'),
-                "bus": horaire.get('ligne', 'N/A'),
-                "Passage": horaire.get('passage', 1),
-                "Destination": horaire.get('destination', 'N/A'),
-                "Direction": horaire.get('direction', 'N/A'),
-                "horaire_temsp_reel": horaire_temps_reel_timestamp,  # VÉRIFIER LE NOM !
-                "horaire_theorique": horaire_theorique_timestamp,
-                "statut": horaire.get('statut', 'N/A'),
-                "retard": horaire.get('retard', '0S'),
-                "lat": horaire.get('lat', 43.1242),
-                "long": horaire.get('long', 5.9306),
-                "date_import": int(time.time() * 1000)
-            }
-            
-            # Log des attributs AVANT envoi
-            log.info(f"  ATTRIBUTS: {feature_attrs}")
-            
-            geometry = arcgis.geometry.Point({
-                "x": horaire.get('long', 5.9306),
-                "y": horaire.get('lat', 43.1242),
-                "spatialReference": {"wkid": 4326}
-            })
-            
-            feature = arcgis.features.Feature.from_dict({
-                "attributes": feature_attrs,
-                "geometry": geometry
-            })
-            
-            features.append(feature)
-            
-        except Exception as e:
-            log.error(f"Erreur création feature: {e}")
-            continue
-    
+    log.info(f"CONVERSION TERMINÉE: {len(features)} features créées avec horaires garantis")
     return features
 
 class ArcgisHelper:
@@ -533,9 +508,8 @@ class ArcgisHelper:
 def main():
     """Fonction principale"""
     start_time = time.time()
-    log.info("====== DÉMARRAGE MISE À JOUR MISTRAL - VERSION DÉFINITIVE ======")
-    log.info("====== HORAIRES LIGNES U, 191 & 9 - TEMPS RÉEL + THÉORIQUES ======")
-    log.info("====== CORRECTION: Nom de champ 'horaire_temsp_reel' ======")
+    log.info("====== DÉMARRAGE MISE À JOUR MISTRAL ======")
+    log.info("====== LIGNES U, 191, 9 & 1 - PRIORITÉ TEMPS RÉEL ======")
     
     arcgis_helper = ArcgisHelper()
     statut = "OK"
@@ -554,7 +528,7 @@ def main():
         horaires_data = get_mistral_data_from_api()
         
         if horaires_data:
-            # Convertir en features ArcGIS avec correction nom de champ
+            # Convertir en features ArcGIS avec logique finale
             new_features = convert_to_arcgis_features(horaires_data)
             
             if new_features:
@@ -564,13 +538,11 @@ def main():
                 # Compter les temps réels
                 realtime_count = sum(1 for h in horaires_data if h.get('is_realtime'))
                 
-                message = f"Mise à jour réussie. {nb_operations} horaires traités (dont {realtime_count} temps réel) - Lignes U, 191, 9."
+                message = f"Mise à jour OK. {nb_operations} horaires (dont {realtime_count} TR) - Lignes U,191,9,1."
                 save_progress("OK", message, nb_operations)
                 
                 log.info(f"=== RÉSULTAT FINAL ===")
-                log.info(f"Horaires traités: {nb_operations}")
-                log.info(f"Temps réel détectés: {realtime_count}")
-                log.info(f"Théoriques: {nb_operations - realtime_count}")
+                log.info(f"Horaires: {nb_operations} | TR: {realtime_count} | TH: {nb_operations - realtime_count}")
                 
             else:
                 message = "Erreur conversion en features ArcGIS"
