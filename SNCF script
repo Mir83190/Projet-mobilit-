@@ -1,0 +1,745 @@
+# Import des modules standard
+import json
+import logging
+import datetime
+import os
+import time
+import requests
+import arcgis
+from arcgis.gis import GIS
+from arcgis.features import FeatureLayer
+
+# Initialisation du logging
+log = logging.getLogger()
+LOG_LEVEL = logging.INFO
+log_file = "sncf_update.log"
+FORMAT = "%(asctime)-15s - %(levelname)s - %(message)s"
+logging.basicConfig(format=FORMAT, level=LOG_LEVEL, datefmt='%Y-%m-%d %H:%M:%S',
+                   handlers=[
+                       logging.FileHandler(log_file),
+                       logging.StreamHandler()
+                   ])
+
+# Configuration SNCF API
+config = {
+    "api_key": "",
+    "from_id": "stop_area:SNCF:87742262",  # Toulon Sainte-Musse
+    "base_url": "https://api.sncf.com/v1/coverage/sncf"
+}
+
+# Constantes
+FEATURE_LAYER_TITLE = "Amir_SNCF_horaires"        # Nom de la couche
+SUIVI_LAYER_TITLE = "amir_suivi_script"            # Couche de suivi existante
+PROJET_NAME = "SNCF_Horaires"                      # Nom du projet pour le suivi
+
+# Fichier pour stocker la progression
+PROGRESS_FILE = "sncf_progress.json"
+
+# Date actuelle
+NOW = datetime.datetime.now()
+
+# Coordonnées des gares principales (approximatives)
+GARE_COORDINATES = {
+    "Toulon Sainte-Musse": (5.9778, 43.1242),
+    "Toulon": (5.9306, 43.1242),
+    "La Garde": (6.0103, 43.1247),
+    "La Seyne - Six Fours": (5.8647, 43.0975),
+    "Ollioules - Sanary-sur-Mer": (5.8403, 43.1347),
+    "Bandol": (5.7553, 43.1353),
+    "Saint-Cyr - Les Lecques - La Cadière": (5.7042, 43.1625),
+    "Cassis": (5.5380, 43.2140),
+    "Aubagne": (5.5711, 43.2929),
+    "Marseille Blancarde": (5.3951, 43.3047),
+    "Marseille Saint-Charles": (5.3811, 43.3031),
+    "Hyères": (6.1294, 43.1203),
+    "Solliès-Pont": (6.0428, 43.1969),
+    "Cuers": (6.0731, 43.2386),
+    "Carnoules": (6.1856, 43.2975),
+    "Pignans": (6.2272, 43.3008),
+    "Les Arcs-sur-Argens": (6.4797, 43.4603)
+}
+
+def save_progress(status="OK", message=None, count=0):
+    """Sauve la progression"""
+    data = {
+        "last_execution": NOW.isoformat(),
+        "status": status,
+        "message": message,
+        "count": count,
+        "timestamp": datetime.datetime.now().isoformat()
+    }
+    
+    with open(PROGRESS_FILE, 'w') as f:
+        json.dump(data, f, indent=2)
+    
+    log.info(f"Progression sauvegardée: {status} - {count} trains traités")
+
+def get_request_with_retry(url, headers, params=None, nbRetry=3, waitTime=1):
+    """Effectue une requête HTTP avec retry"""
+    for attempt in range(nbRetry):
+        try:
+            log.debug(f'GET {url}')
+            response = requests.get(url, headers=headers, params=params)
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                raise Exception(f"HTTP {response.status_code}")
+                
+        except Exception as e:
+            log.warning(f"Tentative {attempt+1}/{nbRetry} échouée: {str(e)}")
+            if attempt < nbRetry - 1:
+                time.sleep(waitTime * (attempt + 1))
+            else:
+                raise e
+
+def get_coordinates_for_station(station_name):
+    """Retourne les coordonnées d'une gare"""
+    # Recherche exacte
+    if station_name in GARE_COORDINATES:
+        return GARE_COORDINATES[station_name]
+    
+    # Recherche approximative
+    for gare, coords in GARE_COORDINATES.items():
+        if any(word in station_name for word in gare.split()):
+            return coords
+    
+    # Par défaut : Sainte-Musse
+    return GARE_COORDINATES["Toulon Sainte-Musse"]
+
+def get_direction_from_destination(destination):
+    """Détermine la direction géographique"""
+    dest = destination.lower()
+    if 'marseille' in dest:
+        return "OUEST"
+    elif 'toulon' in dest and 'sainte-musse' not in dest:
+        return "CENTRE"  
+    elif any(word in dest for word in ['hyères', 'arcs', 'draguignan', 'carnoules', 'cuers', 'solliès']):
+        return "EST"
+    else:
+        return "AUTRE"
+
+def check_if_train_cancelled(departure_data):
+    """
+    Vérifie si un train est annulé selon les données de departure
+    """
+    try:
+        # Vérifier le statut dans les données de départ
+        stop_dt = departure_data.get("stop_date_time", {})
+        
+        # Statut d'annulation
+        departure_status = stop_dt.get("departure_status", "")
+        arrival_status = stop_dt.get("arrival_status", "")
+        
+        # Différentes façons dont l'API peut indiquer une annulation
+        cancelled_indicators = ["cancelled", "canceled", "supprime", "supprimé", "deleted"]
+        
+        if (departure_status.lower() in cancelled_indicators or 
+            arrival_status.lower() in cancelled_indicators):
+            return True
+            
+        # Vérifier aussi dans display_informations
+        display_info = departure_data.get("display_informations", {})
+        if display_info.get("status", "").lower() in cancelled_indicators:
+            return True
+            
+        # Vérifier s'il y a des messages d'annulation
+        messages = departure_data.get("messages", [])
+        for message in messages:
+            message_text = message.get("text", "").lower()
+            if any(word in message_text for word in ["annulé", "supprimé", "cancelled", "canceled"]):
+                return True
+                
+        return False
+        
+    except Exception as e:
+        log.debug(f"Erreur vérification annulation: {e}")
+        return False
+
+def check_if_train_delayed(departure_data):
+    """
+    Vérifie si un train a du retard en comparant horaires réels vs théoriques
+    """
+    try:
+        stop_dt = departure_data.get("stop_date_time", {})
+        
+        # Récupérer les horaires
+        real_departure = stop_dt.get("departure_date_time", "")
+        base_departure = stop_dt.get("base_departure_date_time", "")
+        
+        # Si on a les deux horaires et qu'ils sont différents
+        if real_departure and base_departure and real_departure != base_departure:
+            return True
+            
+        # Vérifier aussi les messages de retard
+        messages = departure_data.get("messages", [])
+        for message in messages:
+            message_text = message.get("text", "").lower()
+            if any(word in message_text for word in ["retard", "delay", "delayed", "retardé"]):
+                return True
+                
+        # Vérifier le data_freshness
+        data_freshness = stop_dt.get("data_freshness", "")
+        if data_freshness == "realtime":
+            # Si c'est en temps réel, comparer avec l'horaire théorique
+            return real_departure != base_departure
+            
+        return False
+        
+    except Exception as e:
+        log.debug(f"Erreur vérification retard: {e}")
+        return False
+
+def find_station_id_by_name(station_name: str) -> str | None:
+    """
+    Recherche l'ID d'une station par son nom via l'API SNCF
+    """
+    headers = {"Authorization": config["api_key"]}
+    url = f"{config['base_url']}/places"
+    params = {
+        "q": station_name,
+        "type[]": "stop_area"
+    }
+    
+    try:
+        resp = requests.get(url, headers=headers, params=params)
+        if resp.status_code == 200:
+            places = resp.json().get("places", [])
+            for place in places:
+                if place.get("embedded_type") == "stop_area":
+                    return place["id"]
+        return None
+    except Exception as e:
+        log.debug(f"Erreur recherche ID pour {station_name}: {e}")
+        return None
+
+def get_real_arrival_time_fixed(train_id, departure_datetime, destination_finale):
+    """
+    Version corrigée qui sélectionne le BON journey vers la bonne destination
+    """
+    headers = {"Authorization": config["api_key"]}
+    
+    # Extraire le nom principal de la station (avant la parenthèse)
+    dest_clean = destination_finale.split("(")[0].strip()
+    
+    # Rechercher l'ID de la destination via l'API
+    dest_id = find_station_id_by_name(dest_clean)
+    
+    if not dest_id:
+        log.warning(f"[ERROR] ID non trouvé pour destination: {destination_finale}")
+        return None
+    
+    try:
+        datetime_str = departure_datetime.strftime('%Y%m%dT%H%M%S')
+        url = f"{config['base_url']}/journeys"
+        params = {
+            "from": config['from_id'],
+            "to": dest_id,
+            "datetime": datetime_str,
+            "count": 15,  # Plus de résultats
+            "data_freshness": "realtime"
+        }
+        
+        response = requests.get(url, headers=headers, params=params)
+        
+        if response.status_code == 200:
+            journeys = response.json().get("journeys", [])
+            
+            # NOUVELLE LOGIQUE: Chercher le journey qui va VRAIMENT à la destination
+            best_journey = None
+            best_arrival_time = None
+            
+            for journey in journeys:
+                for section in journey.get("sections", []):
+                    if section.get("type") == "public_transport":
+                        display_info = section.get("display_informations", {})
+                        section_train_id = display_info.get("headsign", "")
+                        
+                        # Correspondance exacte du train
+                        if section_train_id == train_id:
+                            stop_times = section.get("stop_date_times", [])
+                            if stop_times:
+                                last_stop = stop_times[-1]
+                                last_stop_name = last_stop.get("stop_point", {}).get("name", "")
+                                
+                                # VÉRIFIER que le terminus correspond à la destination
+                                if (dest_clean.lower() in last_stop_name.lower() or 
+                                    last_stop_name.lower() in dest_clean.lower()):
+                                    
+                                    # C'est le bon journey !
+                                    arrival_dt_str = last_stop.get("arrival_date_time", "")
+                                    if not arrival_dt_str:
+                                        arrival_dt_str = last_stop.get("base_arrival_date_time", "")
+                                    
+                                    if len(arrival_dt_str) >= 13:
+                                        arrival_hour = int(arrival_dt_str[9:11])
+                                        arrival_min = int(arrival_dt_str[11:13])
+                                        arrival_time = f"{arrival_hour:02d}:{arrival_min:02d}"
+                                        
+                                        log.info(f"[OK] BON JOURNEY trouvé pour {train_id} vers {destination_finale}: {arrival_time}")
+                                        log.info(f"     Terminus: {last_stop_name} ({len(stop_times)} arrêts)")
+                                        return arrival_time
+                                else:
+                                    # Journey vers une autre destination - ignorer
+                                    log.debug(f"Journey {train_id} ignoré - terminus: {last_stop_name} (au lieu de {dest_clean})")
+            
+            # Si pas trouvé avec la méthode stricte, utiliser l'ancienne méthode en backup
+            log.debug(f"Aucun journey exact trouvé pour {train_id} vers {dest_clean}, fallback...")
+            
+            for journey in journeys:
+                for section in journey.get("sections", []):
+                    if section.get("type") == "public_transport":
+                        display_info = section.get("display_informations", {})
+                        section_train_id = display_info.get("headsign", "")
+                        
+                        if section_train_id == train_id:
+                            stop_times = section.get("stop_date_times", [])
+                            if stop_times:
+                                # Prendre le journey avec le plus d'arrêts (plus complet)
+                                if best_journey is None or len(stop_times) > len(best_journey):
+                                    best_journey = stop_times
+                                    
+                                    last_stop = stop_times[-1]
+                                    arrival_dt_str = last_stop.get("arrival_date_time", "")
+                                    if not arrival_dt_str:
+                                        arrival_dt_str = last_stop.get("base_arrival_date_time", "")
+                                    
+                                    if len(arrival_dt_str) >= 13:
+                                        arrival_hour = int(arrival_dt_str[9:11])
+                                        arrival_min = int(arrival_dt_str[11:13])
+                                        best_arrival_time = f"{arrival_hour:02d}:{arrival_min:02d}"
+            
+            if best_arrival_time:
+                last_stop_name = best_journey[-1].get("stop_point", {}).get("name", "")
+                log.info(f"[OK] FALLBACK - Journey le plus complet pour {train_id}: {best_arrival_time}")
+                log.info(f"     Terminus: {last_stop_name} ({len(best_journey)} arrêts)")
+                return best_arrival_time
+        
+        log.debug(f"Aucune correspondance trouvée pour {train_id} vers {destination_finale}")
+        return None
+        
+    except Exception as e:
+        log.debug(f"Erreur récupération temps réel pour {train_id}: {str(e)}")
+        return None
+
+def get_real_arrival_time_alternative(train_id, departure_datetime, destination_finale):
+    """
+    MÉTHODE ALTERNATIVE: Utilise l'endpoint /departures avec plus de détails
+    """
+    headers = {"Authorization": config["api_key"]}
+    
+    try:
+        # Récupérer plus de départs avec détails
+        url = f"{config['base_url']}/stop_areas/{config['from_id']}/departures"
+        params = {
+            "count": 30,
+            "data_freshness": "realtime",
+            "depth": 2  # Plus de détails
+        }
+        
+        response = requests.get(url, headers=headers, params=params)
+        
+        if response.status_code == 200:
+            departures = response.json().get("departures", [])
+            
+            for dep in departures:
+                display_info = dep.get("display_informations", {})
+                dep_train_id = display_info.get("headsign", "")
+                dep_destination = display_info.get("direction", "")
+                
+                # Correspondance exacte
+                if dep_train_id == train_id and destination_finale in dep_destination:
+                    
+                    # Vérifier s'il y a des informations d'arrivée directement
+                    stop_dt = dep.get("stop_date_time", {})
+                    
+                    # Parfois l'API a directement l'info d'arrivée au terminus
+                    if "arrival_date_time" in stop_dt:
+                        arrival_str = stop_dt["arrival_date_time"]
+                        if len(arrival_str) >= 13:
+                            arrival_hour = int(arrival_str[9:11])
+                            arrival_min = int(arrival_str[11:13])
+                            arrival_time = f"{arrival_hour:02d}:{arrival_min:02d}"
+                            
+                            log.info(f"[OK] DONNÉES RÉELLES (endpoint departures) pour {train_id}: {arrival_time}")
+                            return arrival_time
+        
+        return None
+        
+    except Exception as e:
+        log.debug(f"Erreur méthode alternative pour {train_id}: {str(e)}")
+        return None
+
+def get_real_arrival_time_robust_fixed(train_id, departure_datetime, destination_finale):
+    """
+    Version robuste corrigée
+    """
+    # Méthode 1: Nouvelle approche corrigée
+    result = get_real_arrival_time_fixed(train_id, departure_datetime, destination_finale)
+    if result:
+        return result
+    
+    # Méthode 2: Approche alternative via /departures
+    result = get_real_arrival_time_alternative(train_id, departure_datetime, destination_finale)
+    if result:
+        return result
+    
+    # Méthode 3: Fenêtre élargie si besoin
+    log.debug(f"Tentative avec fenêtre élargie pour {train_id}")
+    
+    headers = {"Authorization": config["api_key"]}
+    dest_clean = destination_finale.split("(")[0].strip()
+    dest_id = find_station_id_by_name(dest_clean)
+    
+    if dest_id:
+        try:
+            for offset in [-15, 0, 15]:
+                test_datetime = departure_datetime + datetime.timedelta(minutes=offset)
+                datetime_str = test_datetime.strftime('%Y%m%dT%H%M%S')
+                
+                url = f"{config['base_url']}/journeys"
+                params = {
+                    "from": config['from_id'],
+                    "to": dest_id,
+                    "datetime": datetime_str,
+                    "count": 10,
+                    "data_freshness": "realtime"
+                }
+                
+                response = requests.get(url, headers=headers, params=params)
+                if response.status_code == 200:
+                    journeys = response.json().get("journeys", [])
+                    
+                    for journey in journeys:
+                        for section in journey.get("sections", []):
+                            if (section.get("type") == "public_transport" and 
+                                section.get("display_informations", {}).get("headsign") == train_id):
+                                
+                                stop_times = section.get("stop_date_times", [])
+                                if stop_times:
+                                    last_stop = stop_times[-1]
+                                    last_stop_name = last_stop.get("stop_point", {}).get("name", "")
+                                    
+                                    # Vérifier que c'est bien la bonne destination
+                                    if (dest_clean.lower() in last_stop_name.lower() or 
+                                        last_stop_name.lower() in dest_clean.lower()):
+                                        
+                                        arrival_dt_str = last_stop.get("arrival_date_time", "") or last_stop.get("base_arrival_date_time", "")
+                                        
+                                        if len(arrival_dt_str) >= 13:
+                                            arrival_hour = int(arrival_dt_str[9:11])
+                                            arrival_min = int(arrival_dt_str[11:13])
+                                            arrival_time = f"{arrival_hour:02d}:{arrival_min:02d}"
+                                            
+                                            log.info(f"[OK] DONNÉES RÉELLES (fenêtre élargie +{offset}min) pour {train_id}: {arrival_time}")
+                                            return arrival_time
+        except Exception as e:
+            log.debug(f"Erreur fenêtre élargie pour {train_id}: {str(e)}")
+    
+    return None
+
+def get_train_data_from_api():
+    """Récupère les données des trains depuis l'API SNCF avec gestion complète"""
+    log.info("Récupération des données trains depuis l'API SNCF...")
+    
+    headers = {"Authorization": config["api_key"]}
+    
+    # Récupérer les prochains départs avec plus de détails
+    url = f"{config['base_url']}/stop_areas/{config['from_id']}/departures"
+    params = {
+        "count": 15,
+        "data_freshness": "realtime",  # Important pour avoir les retards et annulations
+        "depth": 2  # Plus de détails
+    }
+    
+    departures_data = get_request_with_retry(url, headers, params)
+    departures = departures_data.get("departures", [])
+    
+    log.info(f"{len(departures)} départs récupérés")
+    
+    trains_features = []
+    now = datetime.datetime.now()
+    real_data_count = 0
+    cancelled_count = 0
+    delayed_count = 0
+    skipped_count = 0
+    
+    for dep in departures:
+        try:
+            display_info = dep.get("display_informations", {})
+            stop_dt = dep.get("stop_date_time", {})
+            
+            # Informations de base
+            train_id = display_info.get("headsign", "")
+            destination_finale = display_info.get("direction", "")
+            type_train = display_info.get("commercial_mode", "")
+            
+            # Heure de départ
+            dept_time_str = stop_dt.get("departure_date_time", "")
+            if len(dept_time_str) >= 13:
+                dept_hour = int(dept_time_str[9:11])
+                dept_min = int(dept_time_str[11:13])
+                dept_datetime = now.replace(hour=dept_hour, minute=dept_min, second=0, microsecond=0)
+                
+                # Seulement les trains futurs
+                if dept_datetime <= now:
+                    continue
+                
+                depart_sainte_musse = f"{dept_hour:02d}:{dept_min:02d}"
+                minutes_restant = int((dept_datetime - now).total_seconds() / 60)
+                
+                # VÉRIFIER SI LE TRAIN EST ANNULÉ
+                is_cancelled = check_if_train_cancelled(dep)
+                
+                if is_cancelled:
+                    # Train annulé - inclure avec statut spécial
+                    cancelled_count += 1
+                    log.warning(f"[CANCELLED] Train {train_id} vers {destination_finale}: ANNULÉ")
+                    
+                    # Créer une entrée spéciale pour train annulé
+                    statut_temps = "ANNULE"
+                    heure_arrivee_finale = "ANNULÉ"
+                    direction = "ANNULATION"
+                    
+                    # Utiliser les coordonnées de Sainte-Musse par défaut pour les annulations
+                    dest_coords = GARE_COORDINATES["Toulon Sainte-Musse"]
+                    
+                    feature_attrs = {
+                        "TRAIN_ID": train_id,
+                        "DEPART_SAINTE_MUSSE": depart_sainte_musse,
+                        "DESTINATION_FINALE": destination_finale,
+                        "HEURE_ARRIVEE_FINALE": heure_arrivee_finale,
+                        "TYPE_TRAIN": type_train,
+                        "DATE_HEURE": dept_datetime,
+                        "DATE_IMPORT": NOW,
+                        "STATUT_TEMPS": statut_temps,
+                        "MINUTES_RESTANT": minutes_restant,
+                        "DIRECTION": direction,
+                        "LAT": dest_coords[1],
+                        "LON": dest_coords[0]
+                    }
+                    
+                    geometry = arcgis.geometry.Point({
+                        "x": dest_coords[0],
+                        "y": dest_coords[1],
+                        "spatialReference": {"wkid": 4326}
+                    })
+                    
+                    feature = arcgis.features.Feature.from_dict({
+                        "attributes": feature_attrs,
+                        "geometry": geometry
+                    })
+                    
+                    trains_features.append(feature)
+                    continue
+                
+                # VÉRIFIER SI LE TRAIN A DU RETARD
+                is_delayed = check_if_train_delayed(dep)
+                
+                # Train normal - essayer de récupérer les vraies données
+                real_arrival = get_real_arrival_time_robust_fixed(train_id, dept_datetime, destination_finale)
+                
+                if real_arrival:
+                    heure_arrivee_finale = real_arrival
+                    real_data_count += 1
+                    
+                    # DÉTERMINER LE STATUT avec gestion des retards
+                    if is_delayed:
+                        delayed_count += 1
+                        statut_temps = "RETARD"  # Retard détecté
+                        log.warning(f"[DELAYED] Train {train_id} vers {destination_finale}: RETARD - Arrivée {real_arrival}")
+                    else:
+                        # Statut temps normal
+                        if minutes_restant <= 5:
+                            statut_temps = "IMMINENT"      # Train part dans ≤ 5min
+                        elif minutes_restant <= 20:
+                            statut_temps = "BIENTOT"       # Train part dans 6-20min  
+                        else:
+                            statut_temps = "NORMAL"        # Train part dans > 20min
+                        log.info(f"[OK] DONNÉES RÉELLES - Train {train_id} vers {destination_finale}: {real_arrival}")
+                    
+                    direction = get_direction_from_destination(destination_finale)
+                    dest_coords = get_coordinates_for_station(destination_finale)
+                    
+                    feature_attrs = {
+                        "TRAIN_ID": train_id,
+                        "DEPART_SAINTE_MUSSE": depart_sainte_musse,
+                        "DESTINATION_FINALE": destination_finale,
+                        "HEURE_ARRIVEE_FINALE": heure_arrivee_finale,
+                        "TYPE_TRAIN": type_train,
+                        "DATE_HEURE": dept_datetime,
+                        "DATE_IMPORT": NOW,
+                        "STATUT_TEMPS": statut_temps,
+                        "MINUTES_RESTANT": minutes_restant,
+                        "DIRECTION": direction,
+                        "LAT": dest_coords[1],
+                        "LON": dest_coords[0]
+                    }
+                    
+                    geometry = arcgis.geometry.Point({
+                        "x": dest_coords[0],
+                        "y": dest_coords[1],
+                        "spatialReference": {"wkid": 4326}
+                    })
+                    
+                    feature = arcgis.features.Feature.from_dict({
+                        "attributes": feature_attrs,
+                        "geometry": geometry
+                    })
+                    
+                    trains_features.append(feature)
+                    
+                else:
+                    skipped_count += 1
+                    log.warning(f"[SKIP] DONNÉES MANQUANTES - Train {train_id} vers {destination_finale}: IGNORÉ")
+                
+        except Exception as e:
+            log.warning(f"Erreur lors du traitement d'un train: {str(e)}")
+            continue
+    
+    log.info(f"[RÉSULTAT] {real_data_count} trains avec DONNÉES RÉELLES, {delayed_count} trains en RETARD, {cancelled_count} trains ANNULÉS, {skipped_count} trains sans données")
+    log.info(f"[SUCCESS] {len(trains_features)} trains traités - Données complètes (réelles + retards + annulations)")
+    return trains_features
+
+class ArcgisHelper:
+    """Classe pour interagir avec ArcGIS"""
+    def __init__(self):
+        self.gis = GIS("home")
+    
+    def findFeatureLayerByTitle(self, title):
+        """Trouve une couche par son titre"""
+        items = self.gis.content.search(title, item_type="Feature Layer")
+        if items:
+            return items[0].layers[0]
+        return None
+    
+    def log_execution(self, statut, nb_enregistrements, message=None):
+        """Enregistre l'exécution dans la couche de suivi"""
+        try:
+            suivi_layer = self.findFeatureLayerByTitle(SUIVI_LAYER_TITLE)
+            if not suivi_layer:
+                log.error(f"Couche de suivi {SUIVI_LAYER_TITLE} non trouvée")
+                return False
+            
+            suivi_record = {
+                "attributes": {
+                    "projet": PROJET_NAME,
+                    "statut": statut,
+                    "date_debut": int(time.time() * 1000),
+                    "date_fin": int(time.time() * 1000),
+                    "nb_enregistrements": nb_enregistrements,
+                    "message": message or "",
+                    "alerte_envoyee": 0  # Pas d'email
+                }
+            }
+            
+            result = suivi_layer.edit_features(adds=[suivi_record])
+            
+            if 'addResults' in result and result['addResults'][0]['success']:
+                log.info(f"Exécution enregistrée dans la couche de suivi: {statut}")
+                return True
+            else:
+                log.error(f"Erreur lors de l'enregistrement: {result}")
+                return False
+                
+        except Exception as e:
+            log.error(f"Erreur couche de suivi: {str(e)}")
+            return False
+    
+    def update_train_data(self, train_layer, new_features):
+        """Met à jour les données des trains avec vidage complet (méthode delete_features)"""
+        log.info("Mise à jour des données trains avec vidage complet...")
+        
+        try:
+            # 1. Supprimer tous les enregistrements existants avec delete_features
+            log.info("Suppression de tous les enregistrements existants...")
+            delete_result = train_layer.delete_features(where="1=1")
+            
+            if 'deleteResults' in delete_result:
+                deleted_count = len([r for r in delete_result['deleteResults'] if r.get('success', False)])
+                log.info(f"{deleted_count} enregistrements supprimés")
+            else:
+                log.info("Suppression effectuée")
+            
+            # 2. Ajouter tous les nouveaux trains avec edit_features
+            if new_features:
+                log.info(f"Ajout de {len(new_features)} nouveaux trains (réels + retards + annulés)...")
+                add_result = train_layer.edit_features(adds=new_features)
+                
+                if 'addResults' in add_result:
+                    added_count = len([r for r in add_result['addResults'] if r.get('success', False)])
+                    failed_count = len([r for r in add_result['addResults'] if not r.get('success', False)])
+                    
+                    log.info(f"[SUCCESS] {added_count} enregistrements ajoutés avec succès (DONNÉES ULTRA-COMPLÈTES)")
+                    if failed_count > 0:
+                        log.warning(f"{failed_count} enregistrements ont échoué")
+                        # Afficher les erreurs
+                        for i, result in enumerate(add_result['addResults']):
+                            if not result.get('success', False):
+                                error_msg = result.get('error', {}).get('description', 'Erreur inconnue')
+                                log.error(f"Erreur train {i}: {error_msg}")
+                    
+                    return added_count
+                else:
+                    log.error(f"Format de réponse inattendu pour l'ajout: {add_result}")
+                    return 0
+            else:
+                log.info("Aucun nouveau train à ajouter")
+                return 0
+                
+        except Exception as e:
+            log.error(f"Erreur lors de la mise à jour: {str(e)}")
+            return 0
+
+def main():
+    """Fonction principale"""
+    start_time = time.time()
+    log.info("====== DÉMARRAGE MISE À JOUR SNCF - DONNÉES ULTRA-COMPLÈTES (RÉELLES + RETARDS + ANNULATIONS) ======")
+    
+    arcgis_helper = ArcgisHelper()
+    statut = "OK"
+    message = ""
+    nb_operations = 0
+    
+    try:
+        # Connexion à la couche SNCF
+        train_layer = arcgis_helper.findFeatureLayerByTitle(FEATURE_LAYER_TITLE)
+        if not train_layer:
+            raise Exception(f"Couche {FEATURE_LAYER_TITLE} introuvable")
+        
+        log.info(f"Couche trouvée: {train_layer.properties['name']}")
+        
+        # Récupérer les données depuis l'API (DONNÉES ULTRA-COMPLÈTES)
+        new_features = get_train_data_from_api()
+        
+        if new_features:
+            # Mettre à jour la couche
+            nb_operations = arcgis_helper.update_train_data(train_layer, new_features)
+            message = f"Mise à jour réussie avec données ultra-complètes (réelles + retards + annulations). {nb_operations} trains traités."
+            save_progress("OK", message, nb_operations)
+        else:
+            message = "Aucune donnée disponible depuis l'API"
+            log.warning(message)
+            save_progress("WARNING", message, 0)
+            statut = "WARNING"
+        
+        # Temps d'exécution
+        elapsed_time = time.time() - start_time
+        log.info(f"====== FIN MISE À JOUR - Durée: {elapsed_time:.1f}s ======")
+        
+    except Exception as e:
+        statut = "ERREUR"
+        message = f"Erreur: {str(e)}"
+        log.exception(f"Erreur lors de la mise à jour: {str(e)}")
+        save_progress("ERROR", message, 0)
+    
+    finally:
+        # Enregistrer dans la couche de suivi
+        arcgis_helper.log_execution(statut, nb_operations, message)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        log.critical(f"Erreur critique: {str(e)}")
+        exit(1)
